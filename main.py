@@ -86,7 +86,7 @@ def fetch_lyrics(title, artist, duration=None):
         lyrics = syncedlyrics.search(
             search_query,
             synced_only=True,
-            providers=["Lrclib", "Musixmatch", "Deezer", "NetEase"],
+            providers=["Lrclib", "NetEase", "Megalobiz"],
         )
 
         return lyrics
