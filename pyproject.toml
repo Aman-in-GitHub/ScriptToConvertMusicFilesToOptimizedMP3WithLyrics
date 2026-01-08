@@ -1,0 +1,8 @@
+[project]
+name = "music"
+version = "0.0.0"
+requires-python = ">=3.10"
+dependencies = [
+    "mutagen>=1.47.0",
+    "syncedlyrics>=1.0.1",
+]
