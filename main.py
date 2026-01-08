@@ -163,6 +163,22 @@ def convert_audio_to_mp3():
         ".mpc",
         ".tta",
         ".wv",
+        ".alac",
+        ".dsd",
+        ".dsf",
+        ".dff",
+        ".tak",
+        ".3gp",
+        ".amr",
+        ".ac3",
+        ".dts",
+        ".mp2",
+        ".ra",
+        ".rm",
+        ".voc",
+        ".au",
+        ".snd",
+        ".webm",
     }
 
     current_dir = Path.cwd()
