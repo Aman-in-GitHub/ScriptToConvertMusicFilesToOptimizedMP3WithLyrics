@@ -3,7 +3,10 @@ import re
 import shutil
 import subprocess
 import time
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Lock
 
 try:
     from mutagen.id3 import ID3, TALB, TIT2, TPE1, USLT
@@ -182,7 +185,7 @@ def process_lyrics_for_file(file_path, filename):
         return "failed_embed"
 
 
-def convert_audio_to_mp3():
+def convert_audio_to_mp3(convert_workers_override=None, lyrics_workers_override=None):
     audio_extensions = {
         ".opus",
         ".flac",
@@ -221,6 +224,17 @@ def convert_audio_to_mp3():
 
     compressed_dir.mkdir(exist_ok=True)
 
+    cpu_count = os.cpu_count() or 4
+    default_convert_workers = max(1, cpu_count - 2)
+    convert_workers = (
+        convert_workers_override
+        if convert_workers_override is not None
+        else default_convert_workers
+    )
+    lyrics_workers = (
+        lyrics_workers_override if lyrics_workers_override is not None else 4
+    )
+
     converted_count = 0
     copied_count = 0
     skipped_count = 0
@@ -244,99 +258,147 @@ def convert_audio_to_mp3():
         print("Lyrics embedding: ENABLED")
     else:
         print("Lyrics embedding: DISABLED (missing libraries)")
+    print(f"Conversion workers: {convert_workers}")
+    if MUTAGEN_AVAILABLE and SYNCEDLYRICS_AVAILABLE:
+        print(f"Lyrics workers: {lyrics_workers}")
 
     print("-" * 50)
 
-    for root, _, files in os.walk(current_dir):
-        root_path = Path(root)
+    counts_lock = Lock()
+    print_lock = Lock()
 
-        if compressed_dir in root_path.parents or root_path == compressed_dir:
-            continue
+    def safe_print(msg):
+        with print_lock:
+            print(msg)
 
-        audio_files = [f for f in files if Path(f).suffix.lower() in audio_extensions]
-        mp3_files = [f for f in files if Path(f).suffix.lower() == ".mp3"]
+    def update_lyrics_stats(result):
+        if result in lyrics_stats:
+            with counts_lock:
+                lyrics_stats[result] += 1
 
-        if audio_files or mp3_files:
-            rel_path = root_path.relative_to(current_dir)
-            output_dir = compressed_dir / rel_path
-            output_dir.mkdir(parents=True, exist_ok=True)
+    def run_lyrics(output_file, filename):
+        result = process_lyrics_for_file(output_file, filename)
+        if result == "skipped_tag_error":
+            time.sleep(0.5)
+            result = process_lyrics_for_file(output_file, filename)
+        update_lyrics_stats(result)
 
-            print(f"\nProcessing: {rel_path}")
+    def convert_file(input_file, output_file, filename, lyrics_pool):
+        nonlocal converted_count, error_count
+        try:
+            cmd = [
+                "ffmpeg",
+                "-i",
+                str(input_file),
+                "-c:a",
+                "libmp3lame",
+                "-q:a",
+                "2",
+                "-map_metadata",
+                "0",
+                "-id3v2_version",
+                "3",
+                "-vn",
+                "-y",
+                str(output_file),
+            ]
 
-            for filename in audio_files:
-                input_file = root_path / filename
-                output_file = output_dir / f"{Path(filename).stem}.mp3"
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
 
-                if output_file.exists():
-                    print(f"   Skip: {filename} (already exists)")
-                    skipped_count += 1
-                    continue
+            safe_print(f"   Converted: {filename}")
+            with counts_lock:
+                converted_count += 1
 
-                try:
-                    cmd = [
-                        "ffmpeg",
-                        "-i",
-                        str(input_file),
-                        "-c:a",
-                        "libmp3lame",
-                        "-q:a",
-                        "2",
-                        "-map_metadata",
-                        "0",
-                        "-id3v2_version",
-                        "3",
-                        "-vn",
-                        "-y",
-                        str(output_file),
-                    ]
+            if MUTAGEN_AVAILABLE and SYNCEDLYRICS_AVAILABLE:
+                lyrics_pool.submit(run_lyrics, output_file, filename)
+        except subprocess.CalledProcessError as e:
+            safe_print(f"   Error converting {filename}: {e}")
+            if e.stderr:
+                safe_print(f"   FFmpeg error: {e.stderr.strip()}")
+            with counts_lock:
+                error_count += 1
+        except Exception as e:
+            safe_print(f"   Unexpected error with {filename}: {e}")
+            with counts_lock:
+                error_count += 1
 
-                    subprocess.run(cmd, capture_output=True, text=True, check=True)
+    def copy_file(input_file, output_file, filename, lyrics_pool):
+        nonlocal copied_count, error_count
+        try:
+            shutil.copy2(input_file, output_file)
+            safe_print(f"   Copied: {filename}")
+            with counts_lock:
+                copied_count += 1
 
-                    print(f"   Converted: {filename}")
-                    converted_count += 1
+            if MUTAGEN_AVAILABLE and SYNCEDLYRICS_AVAILABLE:
+                lyrics_pool.submit(run_lyrics, output_file, filename)
+        except Exception as e:
+            safe_print(f"   Error copying {filename}: {e}")
+            with counts_lock:
+                error_count += 1
 
-                    result = process_lyrics_for_file(output_file, filename)
-                    if result == "skipped_tag_error":
-                        time.sleep(0.5)
-                        result = process_lyrics_for_file(output_file, filename)
-                    if result in lyrics_stats:
-                        lyrics_stats[result] += 1
+    futures = []
 
-                except subprocess.CalledProcessError as e:
-                    print(f"   Error converting {filename}: {e}")
-                    if e.stderr:
-                        print(f"   FFmpeg error: {e.stderr.strip()}")
-                    error_count += 1
-                    continue
-                except Exception as e:
-                    print(f"   Unexpected error with {filename}: {e}")
-                    error_count += 1
-                    continue
+    with (
+        ThreadPoolExecutor(max_workers=convert_workers) as convert_pool,
+        ThreadPoolExecutor(max_workers=lyrics_workers) as lyrics_pool,
+    ):
+        for root, _, files in os.walk(current_dir):
+            root_path = Path(root)
 
-            for filename in mp3_files:
-                input_file = root_path / filename
-                output_file = output_dir / filename
+            if compressed_dir in root_path.parents or root_path == compressed_dir:
+                continue
 
-                if output_file.exists():
-                    print(f"   Skip: {filename} (already exists)")
-                    skipped_count += 1
-                    continue
+            audio_files = []
+            mp3_files = []
+            for f in files:
+                suffix = Path(f).suffix.lower()
+                if suffix in audio_extensions:
+                    audio_files.append(f)
+                elif suffix == ".mp3":
+                    mp3_files.append(f)
 
-                try:
-                    shutil.copy2(input_file, output_file)
-                    print(f"   Copied: {filename}")
-                    copied_count += 1
+            if audio_files or mp3_files:
+                rel_path = root_path.relative_to(current_dir)
+                output_dir = compressed_dir / rel_path
+                output_dir.mkdir(parents=True, exist_ok=True)
 
-                    result = process_lyrics_for_file(output_file, filename)
-                    if result == "skipped_tag_error":
-                        time.sleep(0.5)
-                        result = process_lyrics_for_file(output_file, filename)
-                    if result in lyrics_stats:
-                        lyrics_stats[result] += 1
+                safe_print(f"\nProcessing: {rel_path}")
 
-                except Exception as e:
-                    print(f"   Error copying {filename}: {e}")
-                    error_count += 1
+                for filename in audio_files:
+                    input_file = root_path / filename
+                    output_file = output_dir / f"{Path(filename).stem}.mp3"
+
+                    if output_file.exists():
+                        safe_print(f"   Skip: {filename} (already exists)")
+                        with counts_lock:
+                            skipped_count += 1
+                        continue
+
+                    futures.append(
+                        convert_pool.submit(
+                            convert_file, input_file, output_file, filename, lyrics_pool
+                        )
+                    )
+
+                for filename in mp3_files:
+                    input_file = root_path / filename
+                    output_file = output_dir / filename
+
+                    if output_file.exists():
+                        safe_print(f"   Skip: {filename} (already exists)")
+                        with counts_lock:
+                            skipped_count += 1
+                        continue
+
+                    futures.append(
+                        convert_pool.submit(
+                            copy_file, input_file, output_file, filename, lyrics_pool
+                        )
+                    )
+
+        for f in as_completed(futures):
+            _ = f.result()
 
     print("\n" + "=" * 50)
     print("CONVERSION COMPLETE")
@@ -379,6 +441,24 @@ def check_ffmpeg():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Convert audio files to optimized MP3 and optionally embed synced lyrics."
+    )
+    parser.add_argument(
+        "-workers",
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel conversion/copy workers (default: cpu_count-2).",
+    )
+    parser.add_argument(
+        "--lyrics-workers",
+        type=int,
+        default=None,
+        help="Number of parallel lyrics workers (default: 4).",
+    )
+    args = parser.parse_args()
+
     print("Checking FFmpeg installation...")
 
     if not check_ffmpeg():
@@ -408,6 +488,6 @@ if __name__ == "__main__":
     response = input("\nProceed? (y/N): ").strip().lower()
 
     if response == "y":
-        convert_audio_to_mp3()
+        convert_audio_to_mp3(args.workers, args.lyrics_workers)
     else:
         print("Operation cancelled.")
