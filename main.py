@@ -1,13 +1,13 @@
 import os
-import subprocess
-import shutil
-import time
 import re
+import shutil
+import subprocess
+import time
 from pathlib import Path
 
 try:
+    from mutagen.id3 import ID3, TALB, TIT2, TPE1, USLT
     from mutagen.mp3 import MP3
-    from mutagen.id3 import ID3, USLT, TIT2, TPE1, TALB
 
     MUTAGEN_AVAILABLE = True
 except ImportError:
@@ -33,9 +33,17 @@ def extract_metadata(file_path):
         if not audio.tags:
             return None, None, None, None
 
-        title = str(audio.tags.get("TIT2", ""))
-        artist = str(audio.tags.get("TPE1", ""))
-        album = str(audio.tags.get("TALB", ""))
+        def get_text_frame(tag_key):
+            frame = audio.tags.get(tag_key)
+            if frame is None:
+                return None
+            if hasattr(frame, "text") and frame.text:
+                return str(frame.text[0])
+            return str(frame) if frame else None
+
+        title = get_text_frame("TIT2")
+        artist = get_text_frame("TPE1")
+        album = get_text_frame("TALB")
         duration = int(audio.info.length) if audio.info else None
 
         title = title if title else None
@@ -50,15 +58,25 @@ def extract_metadata(file_path):
 
 def parse_filename(filename):
     stem = Path(filename).stem
-    stem = stem.split("(")[0].split("[")[0]
     stem = stem.strip()
 
-    if " - " in stem:
-        parts = stem.split(" - ", 1)
-        return parts[1].strip(), parts[0].strip()
-    else:
-        stem = re.sub(r"^\d+[\s._-]*", "", stem)
-        return stem.strip(), None
+    stem = re.sub(r"[\u2010-\u2015\u2212]", "-", stem)
+
+    stem = re.sub(
+        r"^\s*(?:(?:cd|disc|disk)\s*\d+\s*[-._\s]*)?"
+        r"(?:\d{1,3}(?:[._-]\d{1,3})?\s*[-._]+\s*)",
+        "",
+        stem,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    stem = re.sub(r"\s*[\(\[][^)\]]+[\)\]]\s*$", "", stem).strip()
+
+    m = re.split(r"\s+-\s+", stem, maxsplit=1)
+    if len(m) == 2 and m[0] and m[1]:
+        return m[1].strip(), m[0].strip()
+
+    return stem.strip(), None
 
 
 def check_existing_lyrics(file_path):
@@ -72,27 +90,32 @@ def check_existing_lyrics(file_path):
             return False
 
         return any(k.startswith("USLT") for k in audio.tags.keys())
-    except Exception:
-        return False
+    except Exception as e:
+        print(f"      Lyrics check error: {e}")
+        return None
 
 
-def fetch_lyrics(title, artist, duration=None):
+def fetch_lyrics(title, artist, retries=2, backoff_seconds=1.0):
     if not SYNCEDLYRICS_AVAILABLE or not title:
         return None
 
-    try:
-        search_query = f"{title} {artist}" if artist else title
+    search_query = f"{title} {artist}" if artist else title
+    attempts = retries + 1
 
-        lyrics = syncedlyrics.search(
-            search_query,
-            synced_only=True,
-            providers=["Lrclib", "NetEase", "Megalobiz"],
-        )
+    for attempt in range(1, attempts + 1):
+        try:
+            lyrics = syncedlyrics.search(
+                search_query,
+                synced_only=True,
+                providers=["Lrclib", "NetEase", "Megalobiz"],
+            )
+            return lyrics
+        except Exception as e:
+            print(f"      Lyrics fetch error (attempt {attempt}/{attempts}): {e}")
+            if attempt < attempts:
+                time.sleep(backoff_seconds * attempt)
 
-        return lyrics
-    except Exception as e:
-        print(f"      Lyrics fetch error: {e}")
-        return None
+    return None
 
 
 def embed_lyrics(file_path, lyrics_text):
@@ -105,9 +128,17 @@ def embed_lyrics(file_path, lyrics_text):
         if audio.tags is None:
             audio.add_tags()
 
-        audio.tags.add(USLT(encoding=3, lang="eng", desc="", text=lyrics_text))
-
-        audio.save()
+        existing_uslt = [
+            f
+            for f in audio.tags.getall("USLT")
+            if not (getattr(f, "lang", None) == "eng")
+        ]
+        audio.tags.setall(
+            "USLT",
+            existing_uslt + [USLT(encoding=1, lang="eng", desc="", text=lyrics_text)],
+        )
+        audio.tags.update_to_v23()
+        audio.save(v2_version=3)
         return True
     except Exception as e:
         print(f"      Lyrics embed error: {e}")
@@ -118,7 +149,11 @@ def process_lyrics_for_file(file_path, filename):
     if not MUTAGEN_AVAILABLE or not SYNCEDLYRICS_AVAILABLE:
         return "skipped_no_libs"
 
-    if check_existing_lyrics(file_path):
+    existing = check_existing_lyrics(file_path)
+    if existing is None:
+        print(f"      Skipping lyrics due to tag read error: {filename}")
+        return "skipped_tag_error"
+    if existing:
         print(f"      Lyrics already exist: {filename}")
         return "skipped_exists"
 
@@ -134,7 +169,7 @@ def process_lyrics_for_file(file_path, filename):
         return "failed_no_title"
 
     print(f"      Fetching lyrics: {title}" + (f" - {artist}" if artist else ""))
-    lyrics = fetch_lyrics(title, artist, duration)
+    lyrics = fetch_lyrics(title, artist)
 
     if not lyrics:
         print("      No lyrics found")
@@ -187,6 +222,7 @@ def convert_audio_to_mp3():
     compressed_dir.mkdir(exist_ok=True)
 
     converted_count = 0
+    copied_count = 0
     skipped_count = 0
     error_count = 0
 
@@ -197,6 +233,7 @@ def convert_audio_to_mp3():
         "failed_embed": 0,
         "skipped_exists": 0,
         "skipped_no_libs": 0,
+        "skipped_tag_error": 0,
     }
 
     print("Audio to MP3 Converter Started")
@@ -246,6 +283,9 @@ def convert_audio_to_mp3():
                         "2",
                         "-map_metadata",
                         "0",
+                        "-id3v2_version",
+                        "3",
+                        "-vn",
                         "-y",
                         str(output_file),
                     ]
@@ -255,13 +295,17 @@ def convert_audio_to_mp3():
                     print(f"   Converted: {filename}")
                     converted_count += 1
 
-                    time.sleep(0.5)
                     result = process_lyrics_for_file(output_file, filename)
+                    if result == "skipped_tag_error":
+                        time.sleep(0.5)
+                        result = process_lyrics_for_file(output_file, filename)
                     if result in lyrics_stats:
                         lyrics_stats[result] += 1
 
                 except subprocess.CalledProcessError as e:
                     print(f"   Error converting {filename}: {e}")
+                    if e.stderr:
+                        print(f"   FFmpeg error: {e.stderr.strip()}")
                     error_count += 1
                     continue
                 except Exception as e:
@@ -281,10 +325,12 @@ def convert_audio_to_mp3():
                 try:
                     shutil.copy2(input_file, output_file)
                     print(f"   Copied: {filename}")
-                    converted_count += 1
+                    copied_count += 1
 
-                    time.sleep(0.5)
                     result = process_lyrics_for_file(output_file, filename)
+                    if result == "skipped_tag_error":
+                        time.sleep(0.5)
+                        result = process_lyrics_for_file(output_file, filename)
                     if result in lyrics_stats:
                         lyrics_stats[result] += 1
 
@@ -294,7 +340,9 @@ def convert_audio_to_mp3():
 
     print("\n" + "=" * 50)
     print("CONVERSION COMPLETE")
-    print(f"Files processed: {converted_count}")
+    print(f"Files converted: {converted_count}")
+    print(f"Files copied: {copied_count}")
+    print(f"Files processed: {converted_count + copied_count}")
     print(f"Files skipped: {skipped_count}")
     print(f"Errors: {error_count}")
     print(f"Output location: {compressed_dir}")
@@ -306,6 +354,8 @@ def convert_audio_to_mp3():
         print(f"Not found: {lyrics_stats.get('failed_not_found', 0)}")
         print(f"Already had lyrics: {lyrics_stats.get('skipped_exists', 0)}")
         print(f"No title found: {lyrics_stats.get('failed_no_title', 0)}")
+        if lyrics_stats.get("skipped_tag_error", 0) > 0:
+            print(f"Tag read errors: {lyrics_stats.get('skipped_tag_error', 0)}")
         if lyrics_stats.get("failed_embed", 0) > 0:
             print(f"Embed failed: {lyrics_stats.get('failed_embed', 0)}")
 
